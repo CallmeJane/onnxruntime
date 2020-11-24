@@ -13,99 +13,8 @@ import torch
 import torch.distributed as dist
 
 import onnxruntime
-from onnxruntime import set_seed
 from onnxruntime.training import amp, checkpoint, optim, orttrainer
-from onnxruntime.capi._pybind_state import set_cuda_device_id, get_mpi_context_world_rank, get_mpi_context_world_size
-from orttraining_test_orttrainer_frontend import _load_pytorch_transformer_model
-
-def distributed_setup(save_function):
-    def setup():
-        world_rank = get_mpi_context_world_rank()
-        world_size = get_mpi_context_world_size()
-        device = 'cuda:' + str(world_rank)
-
-        os.environ['RANK'] = str(world_rank)
-        os.environ['WORLD_SIZE'] = str(world_size)
-        os.environ['MASTER_ADDR'] = '127.0.0.1'
-        os.environ['MASTER_PORT'] = '29500'
-
-        set_cuda_device_id(world_rank)
-
-        dist.init_process_group(backend='nccl', world_size=world_size, rank=world_rank)
-        save_function(world_rank, world_size, device)
-    return setup
-
-def load_evaluate_extract_state_dict(device, trainer_opts, checkpoint_dir):
-    seed = 1
-    torch.manual_seed(seed)
-    set_seed(seed)
-
-    # PyTorch transformer model setup
-    learning_rate = 0.1
-    optim_config = optim.LambConfig(lr=learning_rate)
-    model, model_desc, loss_fn, batcher_fn, train_data, _, _ = _load_pytorch_transformer_model(device)
-    trainer = orttrainer.ORTTrainer(model, model_desc, optim_config, loss_fn=loss_fn, options=trainer_opts)
-
-    # load checkpoint into trainer
-    checkpoint.experimental_load_checkpoint(trainer, checkpoint_dir)
-
-    # run an eval step to innitialize the graph
-    torch.manual_seed(seed)
-    set_seed(seed)
-    data, targets = batcher_fn(train_data, 0)
-    trainer.eval_step(data, targets)
-
-    return checkpoint.experimental_state_dict(trainer), model
-
-def split_state_dict(state_dict):
-    optimizer_keys = ['Moment_1_', 'Moment_2_', 'Update_Count_', 'Step_']
-    split_sd = {'optimizer': {}, 'fp32_param': {}, 'fp16_param': {}}
-    for k, v in state_dict.items():
-        mode = 'fp32_param'
-        for optim_key in optimizer_keys:
-            if k.startswith(optim_key):
-                mode = 'optimizer'
-                break
-        if k.endswith('_fp16'):
-            mode = 'fp16_param'
-        split_sd[mode][k] = v
-    return split_sd
-
-def split_name(name):
-        name_split = name.split('_view_')
-        view_num = None
-        if(len(name_split) > 1):
-            view_num = int(name_split[1])
-        optimizer_key = ''
-        fp16_key = ''
-        if name_split[0].startswith('Moment_1'):
-            optimizer_key = 'Moment_1_'
-        elif name_split[0].startswith('Moment_2'):
-            optimizer_key = 'Moment_2_'
-        elif name_split[0].startswith('Update_Count'):
-            optimizer_key = 'Update_Count_'
-        elif name_split[0].endswith('_fp16'):
-            fp16_key = '_fp16'
-        param_name = name_split[0]
-        if optimizer_key != '':
-            param_name = param_name.split(optimizer_key)[1]
-        param_name = param_name.split('_fp16')[0]
-        return param_name, optimizer_key, view_num, fp16_key
-
-def aggregate_states(aggregated_states, state_dict):
-    for key, value in state_dict.items():
-        weight_name, optimizer_key, view_num, fp16_key = split_name(key)
-        if view_num is not None:
-            # parameter is sharded
-            param_name = optimizer_key + weight_name + fp16_key
-
-            if param_name in aggregated_states and optimizer_key not in ['Update_Count_']:
-                # found a previous shard of the param, concatenate shards ordered by ranks
-                aggregated_states[param_name] = torch.cat((aggregated_states[param_name], value))
-            else:
-                aggregated_states[param_name] = value
-        else:
-            aggregated_states[key] = value
+from _test_helpers import distributed_setup, load_evaluate_extract_state_dict, split_state_dict, split_name, aggregate_states
 
 def test_load_from_single_node_full_precision_into_single_node_full_precision(device = 'cuda', checkpoint_dir = 'checkpoint_dir/single_node/full_precision/'):
     opts = {'device' : {'id' : device},
@@ -114,7 +23,7 @@ def test_load_from_single_node_full_precision_into_single_node_full_precision(de
     # extract state dictionaries to compare
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = state['state_dict']
 
     # compare all states
@@ -134,7 +43,7 @@ def test_load_from_single_node_mixed_precision_into_single_node_full_precision(d
     # extract state dictionaries to compare
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = state['state_dict']
 
     # compare all states
@@ -166,7 +75,7 @@ def test_load_from_single_node_mixed_precision_into_single_node_mixed_precision(
     # extract state dictionaries to compare
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = state['state_dict']
 
     # compare all states
@@ -187,7 +96,7 @@ def test_load_from_single_node_full_precision_into_single_node_mixed_precision(d
     # extract state dictionaries to compare
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = state['state_dict']
 
     # compare all states
@@ -206,7 +115,7 @@ def test_load_from_data_parallelism_full_precision_into_single_node_full_precisi
     # extract state dictionaries to compare
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = state['state_dict']
 
     # compare all states
@@ -226,7 +135,7 @@ def test_load_from_data_parallelism_mixed_precision_into_single_node_full_precis
     # extract state dictionaries to compare
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = state['state_dict']
 
     # compare all states
@@ -258,7 +167,7 @@ def test_load_from_data_parallelism_mixed_precision_into_single_node_mixed_preci
     # extract state dictionaries to compare
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = state['state_dict']
 
     # compare all states
@@ -279,7 +188,7 @@ def test_load_from_data_parallelism_full_precision_into_single_node_mixed_precis
     # extract state dictionaries to compare
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = state['state_dict']
 
     # compare all states
@@ -302,7 +211,7 @@ def test_load_from_distributed_zero_full_precision_into_single_node_full_precisi
     num_states = len(glob.glob1(checkpoint_dir,"state_dict*"))
     optimizer_states = dict()
     for rank in range(num_states):
-        state = pickle.load(open(checkpoint_dir+'state_dict_'+str(rank)+'.pkl', 'rb'))
+        state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict_'+str(rank)+'.pkl'), 'rb'))
         state_dict_pre_checkpoint = split_state_dict(state['state_dict_'+str(rank)])
 
         # compare all states
@@ -337,7 +246,7 @@ def test_load_from_distributed_zero_mixed_precision_into_single_node_full_precis
     num_states = len(glob.glob1(checkpoint_dir,"state_dict*"))
     optimizer_states = dict()
     for rank in range(num_states):
-        state = pickle.load(open(checkpoint_dir+'state_dict_'+str(rank)+'.pkl', 'rb'))
+        state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict_'+str(rank)+'.pkl'), 'rb'))
         state_dict_pre_checkpoint = split_state_dict(state['state_dict_'+str(rank)])
 
         # compare all states
@@ -379,7 +288,7 @@ def test_load_from_distributed_zero_mixed_precision_into_single_node_mixed_preci
     num_states = len(glob.glob1(checkpoint_dir,"state_dict*"))
     optimizer_states = dict()
     for rank in range(num_states):
-        state = pickle.load(open(checkpoint_dir+'state_dict_'+str(rank)+'.pkl', 'rb'))
+        state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict_'+str(rank)+'.pkl'), 'rb'))
         state_dict_pre_checkpoint = split_state_dict(state['state_dict_'+str(rank)])
 
         # compare all states
@@ -412,7 +321,7 @@ def test_load_from_distributed_zero_full_precision_into_single_node_mixed_precis
     num_states = len(glob.glob1(checkpoint_dir,"state_dict*"))
     optimizer_states = dict()
     for rank in range(num_states):
-        state = pickle.load(open(checkpoint_dir+'state_dict_'+str(rank)+'.pkl', 'rb'))
+        state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict_'+str(rank)+'.pkl'), 'rb'))
         state_dict_pre_checkpoint = split_state_dict(state['state_dict_'+str(rank)])
 
         # compare all states
@@ -443,7 +352,7 @@ def test_load_from_single_node_full_precision_into_data_parallelism_full_precisi
     # extract state dictionaries to compare
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = state['state_dict']
 
     # compare all states
@@ -472,7 +381,7 @@ def test_load_from_single_node_mixed_precision_into_data_parallelism_full_precis
     # extract state dictionaries to compare
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = state['state_dict']
 
     # compare all states
@@ -511,7 +420,7 @@ def test_load_from_single_node_mixed_precision_into_data_parallelism_mixed_preci
     # extract state dictionaries to compare
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = state['state_dict']
 
     # compare all states
@@ -539,7 +448,7 @@ def test_load_from_single_node_full_precision_into_data_parallelism_mixed_precis
     # extract state dictionaries to compare
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = state['state_dict']
 
     # compare all states
@@ -567,7 +476,7 @@ def test_load_from_data_parallelism_full_precision_into_data_parallelism_full_pr
     # extract state dictionaries to compare
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = state['state_dict']
 
     # compare all states
@@ -596,7 +505,7 @@ def test_load_from_data_parallelism_mixed_precision_into_data_parallelism_full_p
     # extract state dictionaries to compare
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = state['state_dict']
 
     # compare all states
@@ -635,7 +544,7 @@ def test_load_from_data_parallelism_mixed_precision_into_data_parallelism_mixed_
     # extract state dictionaries to compare
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = state['state_dict']
 
     # compare all states
@@ -663,7 +572,7 @@ def test_load_from_data_parallelism_full_precision_into_data_parallelism_mixed_p
     # extract state dictionaries to compare
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = state['state_dict']
 
     # compare all states
@@ -695,7 +604,7 @@ def test_load_from_distributed_zero_full_precision_into_data_parallelism_full_pr
     num_states = len(glob.glob1(checkpoint_dir,"state_dict*"))
     optimizer_states = dict()
     for rank in range(num_states):
-        state = pickle.load(open(checkpoint_dir+'state_dict_'+str(rank)+'.pkl', 'rb'))
+        state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict_'+str(rank)+'.pkl'), 'rb'))
         state_dict_pre_checkpoint = split_state_dict(state['state_dict_'+str(rank)])
 
         # compare all states
@@ -739,7 +648,7 @@ def test_load_from_distributed_zero_mixed_precision_into_data_parallelism_full_p
     num_states = len(glob.glob1(checkpoint_dir,"state_dict*"))
     optimizer_states = dict()
     for rank in range(num_states):
-        state = pickle.load(open(checkpoint_dir+'state_dict_'+str(rank)+'.pkl', 'rb'))
+        state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict_'+str(rank)+'.pkl'), 'rb'))
         state_dict_pre_checkpoint = split_state_dict(state['state_dict_'+str(rank)])
 
         # compare all states
@@ -788,7 +697,7 @@ def test_load_from_distributed_zero_mixed_precision_into_data_parallelism_mixed_
     num_states = len(glob.glob1(checkpoint_dir,"state_dict*"))
     optimizer_states = dict()
     for rank in range(num_states):
-        state = pickle.load(open(checkpoint_dir+'state_dict_'+str(rank)+'.pkl', 'rb'))
+        state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict_'+str(rank)+'.pkl'), 'rb'))
         state_dict_pre_checkpoint = split_state_dict(state['state_dict_'+str(rank)])
 
         # compare all states
@@ -828,7 +737,7 @@ def test_load_from_distributed_zero_full_precision_into_data_parallelism_mixed_p
     num_states = len(glob.glob1(checkpoint_dir,"state_dict*"))
     optimizer_states = dict()
     for rank in range(num_states):
-        state = pickle.load(open(checkpoint_dir+'state_dict_'+str(rank)+'.pkl', 'rb'))
+        state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict_'+str(rank)+'.pkl'), 'rb'))
         state_dict_pre_checkpoint = split_state_dict(state['state_dict_'+str(rank)])
 
         # compare all states
@@ -864,7 +773,7 @@ def test_load_from_single_node_full_precision_into_distributed_zero_full_precisi
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
     state_dict_post_checkpoint = split_state_dict(state_dict_post_checkpoint)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = split_state_dict(state['state_dict'])
 
     # compare all states
@@ -873,14 +782,14 @@ def test_load_from_single_node_full_precision_into_distributed_zero_full_precisi
         assert_allclose(value, state_dict_post_checkpoint['fp32_param'][key])
 
     # round about way of checking optimizer states. Save state dicts into temporary folder, read them and aggregate them.
-    pickle.dump(state_dict_post_checkpoint, open(checkpoint_dir+'distributed_state_'+str(world_rank)+'.pkl', "wb"))
+    pickle.dump(state_dict_post_checkpoint, open(os.path.join(checkpoint_dir, 'distributed_state_'+str(world_rank)+'.pkl'), "wb"))
     dist.barrier()
 
     if world_rank == 0:
         num_states = len(glob.glob1(checkpoint_dir,"distributed_state*"))
         optimizer_states = dict()
         for rank in range(num_states):
-            rank_state_dict = pickle.load(open(checkpoint_dir+'distributed_state_'+str(rank)+'.pkl', 'rb'))
+            rank_state_dict = pickle.load(open(os.path.join(checkpoint_dir, 'distributed_state_'+str(rank)+'.pkl'), 'rb'))
 
             # collect optimizer states for later comparison since they are sharded
             aggregate_states(optimizer_states, rank_state_dict['optimizer'])
@@ -893,7 +802,7 @@ def test_load_from_single_node_full_precision_into_distributed_zero_full_precisi
         """
     
     dist.barrier()
-    os.remove(checkpoint_dir+'distributed_state_'+str(world_rank)+'.pkl')
+    os.remove(os.path.join(checkpoint_dir, 'distributed_state_'+str(world_rank)+'.pkl'))
 
 @distributed_setup
 def test_load_from_single_node_mixed_precision_into_distributed_zero_full_precision(world_rank, world_size, device, checkpoint_dir = 'checkpoint_dir/single_node/mixed_precision/'):
@@ -916,7 +825,7 @@ def test_load_from_single_node_mixed_precision_into_distributed_zero_full_precis
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
     state_dict_post_checkpoint = split_state_dict(state_dict_post_checkpoint)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = split_state_dict(state['state_dict'])
 
     # compare all states
@@ -925,14 +834,14 @@ def test_load_from_single_node_mixed_precision_into_distributed_zero_full_precis
         assert_allclose(value, state_dict_post_checkpoint['fp32_param'][key[:-5]], atol=1e-3)
 
     # round about way of checking optimizer states. Save state dicts into temporary folder, read them and aggregate them.
-    pickle.dump(state_dict_post_checkpoint, open(checkpoint_dir+'distributed_state_'+str(world_rank)+'.pkl', "wb"))
+    pickle.dump(state_dict_post_checkpoint, open(os.path.join(checkpoint_dir, 'distributed_state_'+str(world_rank)+'.pkl'), "wb"))
     dist.barrier()
 
     if world_rank == 0:
         num_states = len(glob.glob1(checkpoint_dir,"distributed_state*"))
         optimizer_states = dict()
         for rank in range(num_states):
-            rank_state_dict = pickle.load(open(checkpoint_dir+'distributed_state_'+str(rank)+'.pkl', 'rb'))
+            rank_state_dict = pickle.load(open(os.path.join(checkpoint_dir, 'distributed_state_'+str(rank)+'.pkl'), 'rb'))
 
             # collect optimizer states for later comparison since they are sharded
             aggregate_states(optimizer_states, rank_state_dict['optimizer'])
@@ -945,7 +854,7 @@ def test_load_from_single_node_mixed_precision_into_distributed_zero_full_precis
         """
     
     dist.barrier()
-    os.remove(checkpoint_dir+'distributed_state_'+str(world_rank)+'.pkl')
+    os.remove(os.path.join(checkpoint_dir, 'distributed_state_'+str(world_rank)+'.pkl'))
 
 @distributed_setup
 def test_load_from_single_node_mixed_precision_into_distributed_zero_mixed_precision(world_rank, world_size, device, checkpoint_dir = 'checkpoint_dir/single_node/mixed_precision/'):
@@ -973,7 +882,7 @@ def test_load_from_single_node_mixed_precision_into_distributed_zero_mixed_preci
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
     state_dict_post_checkpoint = split_state_dict(state_dict_post_checkpoint)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = split_state_dict(state['state_dict'])
 
     # compare all states
@@ -982,14 +891,14 @@ def test_load_from_single_node_mixed_precision_into_distributed_zero_mixed_preci
         assert_allclose(value, state_dict_post_checkpoint['fp16_param'][key])
 
     # round about way of checking optimizer states. Save state dicts into temporary folder, read them and aggregate them.
-    pickle.dump(state_dict_post_checkpoint, open(checkpoint_dir+'distributed_state_'+str(world_rank)+'.pkl', "wb"))
+    pickle.dump(state_dict_post_checkpoint, open(os.path.join(checkpoint_dir, 'distributed_state_'+str(world_rank)+'.pkl'), "wb"))
     dist.barrier()
 
     if world_rank == 0:
         num_states = len(glob.glob1(checkpoint_dir,"distributed_state*"))
         optimizer_states = dict()
         for rank in range(num_states):
-            rank_state_dict = pickle.load(open(checkpoint_dir+'distributed_state_'+str(rank)+'.pkl', 'rb'))
+            rank_state_dict = pickle.load(open(os.path.join(checkpoint_dir, 'distributed_state_'+str(rank)+'.pkl'), 'rb'))
 
             # collect optimizer states for later comparison since they are sharded
             aggregate_states(optimizer_states, rank_state_dict['optimizer'])
@@ -1002,7 +911,7 @@ def test_load_from_single_node_mixed_precision_into_distributed_zero_mixed_preci
         """
     
     dist.barrier()
-    os.remove(checkpoint_dir+'distributed_state_'+str(world_rank)+'.pkl')
+    os.remove(os.path.join(checkpoint_dir, 'distributed_state_'+str(world_rank)+'.pkl'))
 
 @distributed_setup
 def test_load_from_single_node_full_precision_into_distributed_zero_mixed_precision(world_rank, world_size, device, checkpoint_dir = 'checkpoint_dir/single_node/full_precision/'):
@@ -1030,7 +939,7 @@ def test_load_from_single_node_full_precision_into_distributed_zero_mixed_precis
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
     state_dict_post_checkpoint = split_state_dict(state_dict_post_checkpoint)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = split_state_dict(state['state_dict'])
 
     # compare all states
@@ -1039,14 +948,14 @@ def test_load_from_single_node_full_precision_into_distributed_zero_mixed_precis
         assert_allclose(value, state_dict_pre_checkpoint['fp32_param'][key[:-5]], atol=1e-3)
 
     # round about way of checking optimizer states. Save state dicts into temporary folder, read them and aggregate them.
-    pickle.dump(state_dict_post_checkpoint, open(checkpoint_dir+'distributed_state_'+str(world_rank)+'.pkl', "wb"))
+    pickle.dump(state_dict_post_checkpoint, open(os.path.join(checkpoint_dir, 'distributed_state_'+str(world_rank)+'.pkl'), "wb"))
     dist.barrier()
 
     if world_rank == 0:
         num_states = len(glob.glob1(checkpoint_dir,"distributed_state*"))
         optimizer_states = dict()
         for rank in range(num_states):
-            rank_state_dict = pickle.load(open(checkpoint_dir+'distributed_state_'+str(rank)+'.pkl', 'rb'))
+            rank_state_dict = pickle.load(open(os.path.join(checkpoint_dir, 'distributed_state_'+str(rank)+'.pkl'), 'rb'))
 
             # collect optimizer states for later comparison since they are sharded
             aggregate_states(optimizer_states, rank_state_dict['optimizer'])
@@ -1059,7 +968,7 @@ def test_load_from_single_node_full_precision_into_distributed_zero_mixed_precis
         """
     
     dist.barrier()
-    os.remove(checkpoint_dir+'distributed_state_'+str(world_rank)+'.pkl')
+    os.remove(os.path.join(checkpoint_dir, 'distributed_state_'+str(world_rank)+'.pkl'))
 
 @distributed_setup
 def test_load_from_data_parallelism_full_precision_into_distributed_zero_full_precision(world_rank, world_size, device, checkpoint_dir = 'checkpoint_dir/data_parallelism/full_precision/'):
@@ -1082,7 +991,7 @@ def test_load_from_data_parallelism_full_precision_into_distributed_zero_full_pr
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
     state_dict_post_checkpoint = split_state_dict(state_dict_post_checkpoint)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = split_state_dict(state['state_dict'])
 
     # compare all states
@@ -1091,14 +1000,14 @@ def test_load_from_data_parallelism_full_precision_into_distributed_zero_full_pr
         assert_allclose(value, state_dict_post_checkpoint['fp32_param'][key])
 
     # round about way of checking optimizer states. Save state dicts into temporary folder, read them and aggregate them.
-    pickle.dump(state_dict_post_checkpoint, open(checkpoint_dir+'distributed_state_'+str(world_rank)+'.pkl', "wb"))
+    pickle.dump(state_dict_post_checkpoint, open(os.path.join(checkpoint_dir, 'distributed_state_'+str(world_rank)+'.pkl'), "wb"))
     dist.barrier()
 
     if world_rank == 0:
         num_states = len(glob.glob1(checkpoint_dir,"distributed_state*"))
         optimizer_states = dict()
         for rank in range(num_states):
-            rank_state_dict = pickle.load(open(checkpoint_dir+'distributed_state_'+str(rank)+'.pkl', 'rb'))
+            rank_state_dict = pickle.load(open(os.path.join(checkpoint_dir, 'distributed_state_'+str(rank)+'.pkl'), 'rb'))
 
             # collect optimizer states for later comparison since they are sharded
             aggregate_states(optimizer_states, rank_state_dict['optimizer'])
@@ -1111,7 +1020,7 @@ def test_load_from_data_parallelism_full_precision_into_distributed_zero_full_pr
         """
     
     dist.barrier()
-    os.remove(checkpoint_dir+'distributed_state_'+str(world_rank)+'.pkl')
+    os.remove(os.path.join(checkpoint_dir, 'distributed_state_'+str(world_rank)+'.pkl'))
 
 @distributed_setup
 def test_load_from_data_parallelism_mixed_precision_into_distributed_zero_full_precision(world_rank, world_size, device, checkpoint_dir = 'checkpoint_dir/data_parallelism/mixed_precision/'):
@@ -1134,7 +1043,7 @@ def test_load_from_data_parallelism_mixed_precision_into_distributed_zero_full_p
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
     state_dict_post_checkpoint = split_state_dict(state_dict_post_checkpoint)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = split_state_dict(state['state_dict'])
 
     # compare all states
@@ -1143,14 +1052,14 @@ def test_load_from_data_parallelism_mixed_precision_into_distributed_zero_full_p
         assert_allclose(value, state_dict_post_checkpoint['fp32_param'][key[:-5]], atol=1e-3)
 
     # round about way of checking optimizer states. Save state dicts into temporary folder, read them and aggregate them.
-    pickle.dump(state_dict_post_checkpoint, open(checkpoint_dir+'distributed_state_'+str(world_rank)+'.pkl', "wb"))
+    pickle.dump(state_dict_post_checkpoint, open(os.path.join(checkpoint_dir, 'distributed_state_'+str(world_rank)+'.pkl'), "wb"))
     dist.barrier()
 
     if world_rank == 0:
         num_states = len(glob.glob1(checkpoint_dir,"distributed_state*"))
         optimizer_states = dict()
         for rank in range(num_states):
-            rank_state_dict = pickle.load(open(checkpoint_dir+'distributed_state_'+str(rank)+'.pkl', 'rb'))
+            rank_state_dict = pickle.load(open(os.path.join(checkpoint_dir, 'distributed_state_'+str(rank)+'.pkl'), 'rb'))
 
             # collect optimizer states for later comparison since they are sharded
             aggregate_states(optimizer_states, rank_state_dict['optimizer'])
@@ -1163,7 +1072,7 @@ def test_load_from_data_parallelism_mixed_precision_into_distributed_zero_full_p
         """
     
     dist.barrier()
-    os.remove(checkpoint_dir+'distributed_state_'+str(world_rank)+'.pkl')
+    os.remove(os.path.join(checkpoint_dir, 'distributed_state_'+str(world_rank)+'.pkl'))
 
 @distributed_setup
 def test_load_from_data_parallelism_mixed_precision_into_distributed_zero_mixed_precision(world_rank, world_size, device, checkpoint_dir = 'checkpoint_dir/data_parallelism/mixed_precision/'):
@@ -1191,7 +1100,7 @@ def test_load_from_data_parallelism_mixed_precision_into_distributed_zero_mixed_
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
     state_dict_post_checkpoint = split_state_dict(state_dict_post_checkpoint)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = split_state_dict(state['state_dict'])
 
     # compare all states
@@ -1200,14 +1109,14 @@ def test_load_from_data_parallelism_mixed_precision_into_distributed_zero_mixed_
         assert_allclose(value, state_dict_post_checkpoint['fp16_param'][key])
 
     # round about way of checking optimizer states. Save state dicts into temporary folder, read them and aggregate them.
-    pickle.dump(state_dict_post_checkpoint, open(checkpoint_dir+'distributed_state_'+str(world_rank)+'.pkl', "wb"))
+    pickle.dump(state_dict_post_checkpoint, open(os.path.join(checkpoint_dir, 'distributed_state_'+str(world_rank)+'.pkl'), "wb"))
     dist.barrier()
 
     if world_rank == 0:
         num_states = len(glob.glob1(checkpoint_dir,"distributed_state*"))
         optimizer_states = dict()
         for rank in range(num_states):
-            rank_state_dict = pickle.load(open(checkpoint_dir+'distributed_state_'+str(rank)+'.pkl', 'rb'))
+            rank_state_dict = pickle.load(open(os.path.join(checkpoint_dir, 'distributed_state_'+str(rank)+'.pkl'), 'rb'))
 
             # collect optimizer states for later comparison since they are sharded
             aggregate_states(optimizer_states, rank_state_dict['optimizer'])
@@ -1220,7 +1129,7 @@ def test_load_from_data_parallelism_mixed_precision_into_distributed_zero_mixed_
         """
     
     dist.barrier()
-    os.remove(checkpoint_dir+'distributed_state_'+str(world_rank)+'.pkl')
+    os.remove(os.path.join(checkpoint_dir, 'distributed_state_'+str(world_rank)+'.pkl'))
 
 @distributed_setup
 def test_load_from_data_parallelism_full_precision_into_distributed_zero_mixed_precision(world_rank, world_size, device, checkpoint_dir = 'checkpoint_dir/data_parallelism/full_precision/'):
@@ -1248,7 +1157,7 @@ def test_load_from_data_parallelism_full_precision_into_distributed_zero_mixed_p
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
     state_dict_post_checkpoint = split_state_dict(state_dict_post_checkpoint)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict.pkl'), 'rb'))
     state_dict_pre_checkpoint = split_state_dict(state['state_dict'])
 
     # compare all states
@@ -1257,14 +1166,14 @@ def test_load_from_data_parallelism_full_precision_into_distributed_zero_mixed_p
         assert_allclose(value, state_dict_pre_checkpoint['fp32_param'][key[:-5]], atol=1e-3)
 
     # round about way of checking optimizer states. Save state dicts into temporary folder, read them and aggregate them.
-    pickle.dump(state_dict_post_checkpoint, open(checkpoint_dir+'distributed_state_'+str(world_rank)+'.pkl', "wb"))
+    pickle.dump(state_dict_post_checkpoint, open(os.path.join(checkpoint_dir, 'distributed_state_'+str(world_rank)+'.pkl'), "wb"))
     dist.barrier()
 
     if world_rank == 0:
         num_states = len(glob.glob1(checkpoint_dir,"distributed_state*"))
         optimizer_states = dict()
         for rank in range(num_states):
-            rank_state_dict = pickle.load(open(checkpoint_dir+'distributed_state_'+str(rank)+'.pkl', 'rb'))
+            rank_state_dict = pickle.load(open(os.path.join(checkpoint_dir, 'distributed_state_'+str(rank)+'.pkl'), 'rb'))
 
             # collect optimizer states for later comparison since they are sharded
             aggregate_states(optimizer_states, rank_state_dict['optimizer'])
@@ -1277,7 +1186,7 @@ def test_load_from_data_parallelism_full_precision_into_distributed_zero_mixed_p
         """
     
     dist.barrier()
-    os.remove(checkpoint_dir+'distributed_state_'+str(world_rank)+'.pkl')
+    os.remove(os.path.join(checkpoint_dir, 'distributed_state_'+str(world_rank)+'.pkl'))
 
 @distributed_setup
 def test_load_from_distributed_zero_full_precision_into_distributed_zero_full_precision(world_rank, world_size, device, checkpoint_dir = 'checkpoint_dir/distributed_zero/full_precision/'):
@@ -1300,7 +1209,7 @@ def test_load_from_distributed_zero_full_precision_into_distributed_zero_full_pr
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
     state_dict_post_checkpoint = split_state_dict(state_dict_post_checkpoint)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict_'+str(world_rank)+'.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict_'+str(world_rank)+'.pkl'), 'rb'))
     state_dict_pre_checkpoint = split_state_dict(state['state_dict_'+str(world_rank)])
 
     # compare all states
@@ -1333,7 +1242,7 @@ def test_load_from_distributed_zero_mixed_precision_into_distributed_zero_full_p
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
     state_dict_post_checkpoint = split_state_dict(state_dict_post_checkpoint)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict_'+str(world_rank)+'.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict_'+str(world_rank)+'.pkl'), 'rb'))
     state_dict_pre_checkpoint = split_state_dict(state['state_dict_'+str(world_rank)])
 
     # compare all states
@@ -1375,7 +1284,7 @@ def test_load_from_distributed_zero_mixed_precision_into_distributed_zero_mixed_
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
     state_dict_post_checkpoint = split_state_dict(state_dict_post_checkpoint)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict_'+str(world_rank)+'.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict_'+str(world_rank)+'.pkl'), 'rb'))
     state_dict_pre_checkpoint = split_state_dict(state['state_dict_'+str(world_rank)])
 
     # compare all states
@@ -1413,7 +1322,7 @@ def test_load_from_distributed_zero_full_precision_into_distributed_zero_mixed_p
     state_dict_post_checkpoint, model = load_evaluate_extract_state_dict(device, orttrainer.ORTTrainerOptions(opts), checkpoint_dir)
     state_dict_post_checkpoint = split_state_dict(state_dict_post_checkpoint)
 
-    state = pickle.load(open(checkpoint_dir+'state_dict_'+str(world_rank)+'.pkl', 'rb'))
+    state = pickle.load(open(os.path.join(checkpoint_dir, 'state_dict_'+str(world_rank)+'.pkl'), 'rb'))
     state_dict_pre_checkpoint = split_state_dict(state['state_dict_'+str(world_rank)])
 
     # compare all states
@@ -1425,51 +1334,51 @@ def test_load_from_distributed_zero_full_precision_into_distributed_zero_mixed_p
     for key, value in state_dict_pre_checkpoint['optimizer'].items():
         assert_allclose(value, state_dict_post_checkpoint['optimizer'][key])
 
-if __name__ == '__main__':
-    function_map = {
-        # all config to single node config
-        'test_load_from_single_node_full_precision_into_single_node_full_precision': test_load_from_single_node_full_precision_into_single_node_full_precision,
-        'test_load_from_single_node_mixed_precision_into_single_node_mixed_precision': test_load_from_single_node_mixed_precision_into_single_node_mixed_precision,
-        'test_load_from_single_node_mixed_precision_into_single_node_full_precision': test_load_from_single_node_mixed_precision_into_single_node_full_precision,
-        'test_load_from_single_node_full_precision_into_single_node_mixed_precision': test_load_from_single_node_full_precision_into_single_node_mixed_precision,
-        'test_load_from_data_parallelism_full_precision_into_single_node_full_precision': test_load_from_data_parallelism_full_precision_into_single_node_full_precision,
-        'test_load_from_data_parallelism_mixed_precision_into_single_node_full_precision': test_load_from_data_parallelism_mixed_precision_into_single_node_full_precision,
-        'test_load_from_data_parallelism_mixed_precision_into_single_node_mixed_precision': test_load_from_data_parallelism_mixed_precision_into_single_node_mixed_precision,
-        'test_load_from_data_parallelism_full_precision_into_single_node_mixed_precision': test_load_from_data_parallelism_full_precision_into_single_node_mixed_precision,
-        'test_load_from_distributed_zero_full_precision_into_single_node_full_precision': test_load_from_distributed_zero_full_precision_into_single_node_full_precision,
-        'test_load_from_distributed_zero_mixed_precision_into_single_node_full_precision': test_load_from_distributed_zero_mixed_precision_into_single_node_full_precision,
-        'test_load_from_distributed_zero_mixed_precision_into_single_node_mixed_precision': test_load_from_distributed_zero_mixed_precision_into_single_node_mixed_precision,
-        'test_load_from_distributed_zero_full_precision_into_single_node_mixed_precision': test_load_from_distributed_zero_full_precision_into_single_node_mixed_precision,
+function_map = {
+    # all config to single node config
+    'test_load_from_single_node_full_precision_into_single_node_full_precision': test_load_from_single_node_full_precision_into_single_node_full_precision,
+    'test_load_from_single_node_mixed_precision_into_single_node_mixed_precision': test_load_from_single_node_mixed_precision_into_single_node_mixed_precision,
+    'test_load_from_single_node_mixed_precision_into_single_node_full_precision': test_load_from_single_node_mixed_precision_into_single_node_full_precision,
+    'test_load_from_single_node_full_precision_into_single_node_mixed_precision': test_load_from_single_node_full_precision_into_single_node_mixed_precision,
+    'test_load_from_data_parallelism_full_precision_into_single_node_full_precision': test_load_from_data_parallelism_full_precision_into_single_node_full_precision,
+    'test_load_from_data_parallelism_mixed_precision_into_single_node_full_precision': test_load_from_data_parallelism_mixed_precision_into_single_node_full_precision,
+    'test_load_from_data_parallelism_mixed_precision_into_single_node_mixed_precision': test_load_from_data_parallelism_mixed_precision_into_single_node_mixed_precision,
+    'test_load_from_data_parallelism_full_precision_into_single_node_mixed_precision': test_load_from_data_parallelism_full_precision_into_single_node_mixed_precision,
+    'test_load_from_distributed_zero_full_precision_into_single_node_full_precision': test_load_from_distributed_zero_full_precision_into_single_node_full_precision,
+    'test_load_from_distributed_zero_mixed_precision_into_single_node_full_precision': test_load_from_distributed_zero_mixed_precision_into_single_node_full_precision,
+    'test_load_from_distributed_zero_mixed_precision_into_single_node_mixed_precision': test_load_from_distributed_zero_mixed_precision_into_single_node_mixed_precision,
+    'test_load_from_distributed_zero_full_precision_into_single_node_mixed_precision': test_load_from_distributed_zero_full_precision_into_single_node_mixed_precision,
 
-        # all config to data parallel node config
-        'test_load_from_single_node_full_precision_into_data_parallelism_full_precision': test_load_from_single_node_full_precision_into_data_parallelism_full_precision,
-        'test_load_from_single_node_mixed_precision_into_data_parallelism_full_precision': test_load_from_single_node_mixed_precision_into_data_parallelism_full_precision,
-        'test_load_from_single_node_mixed_precision_into_data_parallelism_mixed_precision': test_load_from_single_node_mixed_precision_into_data_parallelism_mixed_precision,
-        'test_load_from_single_node_full_precision_into_data_parallelism_mixed_precision': test_load_from_single_node_full_precision_into_data_parallelism_mixed_precision,
-        'test_load_from_data_parallelism_full_precision_into_data_parallelism_full_precision': test_load_from_data_parallelism_full_precision_into_data_parallelism_full_precision,
-        'test_load_from_data_parallelism_mixed_precision_into_data_parallelism_full_precision': test_load_from_data_parallelism_mixed_precision_into_data_parallelism_full_precision,
-        'test_load_from_data_parallelism_mixed_precision_into_data_parallelism_mixed_precision': test_load_from_data_parallelism_mixed_precision_into_data_parallelism_mixed_precision,
-        'test_load_from_data_parallelism_full_precision_into_data_parallelism_mixed_precision': test_load_from_data_parallelism_full_precision_into_data_parallelism_mixed_precision,
-        'test_load_from_distributed_zero_full_precision_into_data_parallelism_full_precision': test_load_from_distributed_zero_full_precision_into_data_parallelism_full_precision,
-        'test_load_from_distributed_zero_mixed_precision_into_data_parallelism_full_precision': test_load_from_distributed_zero_mixed_precision_into_data_parallelism_full_precision,
-        'test_load_from_distributed_zero_mixed_precision_into_data_parallelism_mixed_precision': test_load_from_distributed_zero_mixed_precision_into_data_parallelism_mixed_precision,
-        'test_load_from_distributed_zero_full_precision_into_data_parallelism_mixed_precision': test_load_from_distributed_zero_full_precision_into_data_parallelism_mixed_precision,
+    # all config to data parallel node config
+    'test_load_from_single_node_full_precision_into_data_parallelism_full_precision': test_load_from_single_node_full_precision_into_data_parallelism_full_precision,
+    'test_load_from_single_node_mixed_precision_into_data_parallelism_full_precision': test_load_from_single_node_mixed_precision_into_data_parallelism_full_precision,
+    'test_load_from_single_node_mixed_precision_into_data_parallelism_mixed_precision': test_load_from_single_node_mixed_precision_into_data_parallelism_mixed_precision,
+    'test_load_from_single_node_full_precision_into_data_parallelism_mixed_precision': test_load_from_single_node_full_precision_into_data_parallelism_mixed_precision,
+    'test_load_from_data_parallelism_full_precision_into_data_parallelism_full_precision': test_load_from_data_parallelism_full_precision_into_data_parallelism_full_precision,
+    'test_load_from_data_parallelism_mixed_precision_into_data_parallelism_full_precision': test_load_from_data_parallelism_mixed_precision_into_data_parallelism_full_precision,
+    'test_load_from_data_parallelism_mixed_precision_into_data_parallelism_mixed_precision': test_load_from_data_parallelism_mixed_precision_into_data_parallelism_mixed_precision,
+    'test_load_from_data_parallelism_full_precision_into_data_parallelism_mixed_precision': test_load_from_data_parallelism_full_precision_into_data_parallelism_mixed_precision,
+    'test_load_from_distributed_zero_full_precision_into_data_parallelism_full_precision': test_load_from_distributed_zero_full_precision_into_data_parallelism_full_precision,
+    'test_load_from_distributed_zero_mixed_precision_into_data_parallelism_full_precision': test_load_from_distributed_zero_mixed_precision_into_data_parallelism_full_precision,
+    'test_load_from_distributed_zero_mixed_precision_into_data_parallelism_mixed_precision': test_load_from_distributed_zero_mixed_precision_into_data_parallelism_mixed_precision,
+    'test_load_from_distributed_zero_full_precision_into_data_parallelism_mixed_precision': test_load_from_distributed_zero_full_precision_into_data_parallelism_mixed_precision,
 
-        # all config to distributed zero node config
-        'test_load_from_single_node_full_precision_into_distributed_zero_full_precision': test_load_from_single_node_full_precision_into_distributed_zero_full_precision,
-        'test_load_from_single_node_mixed_precision_into_distributed_zero_full_precision': test_load_from_single_node_mixed_precision_into_distributed_zero_full_precision,
-        'test_load_from_single_node_mixed_precision_into_distributed_zero_mixed_precision': test_load_from_single_node_mixed_precision_into_distributed_zero_mixed_precision,
-        'test_load_from_single_node_full_precision_into_distributed_zero_mixed_precision': test_load_from_single_node_full_precision_into_distributed_zero_mixed_precision,
-        'test_load_from_data_parallelism_full_precision_into_distributed_zero_full_precision': test_load_from_data_parallelism_full_precision_into_distributed_zero_full_precision,
-        'test_load_from_data_parallelism_mixed_precision_into_distributed_zero_full_precision': test_load_from_data_parallelism_mixed_precision_into_distributed_zero_full_precision,
-        'test_load_from_data_parallelism_mixed_precision_into_distributed_zero_mixed_precision': test_load_from_data_parallelism_mixed_precision_into_distributed_zero_mixed_precision,
-        'test_load_from_data_parallelism_full_precision_into_distributed_zero_mixed_precision': test_load_from_data_parallelism_full_precision_into_distributed_zero_mixed_precision,
-        'test_load_from_distributed_zero_full_precision_into_distributed_zero_full_precision': test_load_from_distributed_zero_full_precision_into_distributed_zero_full_precision,
-        'test_load_from_distributed_zero_mixed_precision_into_distributed_zero_full_precision': test_load_from_distributed_zero_mixed_precision_into_distributed_zero_full_precision,
-        'test_load_from_distributed_zero_mixed_precision_into_distributed_zero_mixed_precision': test_load_from_distributed_zero_mixed_precision_into_distributed_zero_mixed_precision,
-        'test_load_from_distributed_zero_full_precision_into_distributed_zero_mixed_precision': test_load_from_distributed_zero_full_precision_into_distributed_zero_mixed_precision
-    }
-    parser = argparse.ArgumentParser(description='Test saved states of trainers to loaded states')
-    parser.add_argument('scenario', choices=function_map.keys(), help='training scenario to test saved and loaded states')
-    args = parser.parse_args()
-    function_map[args.scenario]()
+    # all config to distributed zero node config
+    'test_load_from_single_node_full_precision_into_distributed_zero_full_precision': test_load_from_single_node_full_precision_into_distributed_zero_full_precision,
+    'test_load_from_single_node_mixed_precision_into_distributed_zero_full_precision': test_load_from_single_node_mixed_precision_into_distributed_zero_full_precision,
+    'test_load_from_single_node_mixed_precision_into_distributed_zero_mixed_precision': test_load_from_single_node_mixed_precision_into_distributed_zero_mixed_precision,
+    'test_load_from_single_node_full_precision_into_distributed_zero_mixed_precision': test_load_from_single_node_full_precision_into_distributed_zero_mixed_precision,
+    'test_load_from_data_parallelism_full_precision_into_distributed_zero_full_precision': test_load_from_data_parallelism_full_precision_into_distributed_zero_full_precision,
+    'test_load_from_data_parallelism_mixed_precision_into_distributed_zero_full_precision': test_load_from_data_parallelism_mixed_precision_into_distributed_zero_full_precision,
+    'test_load_from_data_parallelism_mixed_precision_into_distributed_zero_mixed_precision': test_load_from_data_parallelism_mixed_precision_into_distributed_zero_mixed_precision,
+    'test_load_from_data_parallelism_full_precision_into_distributed_zero_mixed_precision': test_load_from_data_parallelism_full_precision_into_distributed_zero_mixed_precision,
+    'test_load_from_distributed_zero_full_precision_into_distributed_zero_full_precision': test_load_from_distributed_zero_full_precision_into_distributed_zero_full_precision,
+    'test_load_from_distributed_zero_mixed_precision_into_distributed_zero_full_precision': test_load_from_distributed_zero_mixed_precision_into_distributed_zero_full_precision,
+    'test_load_from_distributed_zero_mixed_precision_into_distributed_zero_mixed_precision': test_load_from_distributed_zero_mixed_precision_into_distributed_zero_mixed_precision,
+    'test_load_from_distributed_zero_full_precision_into_distributed_zero_mixed_precision': test_load_from_distributed_zero_full_precision_into_distributed_zero_mixed_precision
+}
+parser = argparse.ArgumentParser(description='Test saved states of trainers to loaded states')
+parser.add_argument('--scenario', choices=function_map.keys(), help='training scenario to test saved and loaded states', required=True)
+parser.add_argument('--checkpoint_dir', help='path to the saved states directory', required=True)
+args = parser.parse_args()
+function_map[args.scenario](checkpoint_dir=args.checkpoint_dir)

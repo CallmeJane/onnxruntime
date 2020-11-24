@@ -11,49 +11,8 @@ import torch
 import torch.distributed as dist
 
 from onnxruntime import set_seed
-from onnxruntime.training import amp, checkpoint, optim, orttrainer
-from orttraining_test_orttrainer_frontend import _load_pytorch_transformer_model
-from onnxruntime.capi._pybind_state import set_cuda_device_id, get_mpi_context_world_rank, get_mpi_context_world_size
-
-def train(trainer, train_data, batcher_fn, total_batch_steps = 5, seed = 1):
-    for i in range(total_batch_steps):
-        torch.manual_seed(seed)
-        set_seed(seed)
-        data, targets = batcher_fn(train_data, i*35)
-        trainer.train_step(data, targets)
-
-def makedir(checkpoint_dir):
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir, exist_ok = True)
-
-def save(trainer, checkpoint_dir, state_dict_key_name = 'state_dict'):
-    # save current model parameters as a checkpoint
-    makedir(checkpoint_dir)
-    checkpoint.experimental_save_checkpoint(trainer, checkpoint_dir)
-    state_dict = checkpoint.experimental_state_dict(trainer)
-    pickle.dump({state_dict_key_name : state_dict}, open(checkpoint_dir+state_dict_key_name+'.pkl', "wb"))
-
-def chunkify(sequence, num_chunks):
-    quo, rem = divmod(len(sequence), num_chunks)
-    return (sequence[i * quo + min(i, rem):(i + 1) * quo + min(i + 1, rem)] for i in range(num_chunks))
-
-def distributed_setup(save_function):
-    def setup():
-        world_rank = get_mpi_context_world_rank()
-        world_size = get_mpi_context_world_size()
-        device = 'cuda:' + str(world_rank)
-
-        os.environ['RANK'] = str(world_rank)
-        os.environ['WORLD_SIZE'] = str(world_size)
-        os.environ['MASTER_ADDR'] = '127.0.0.1'
-        os.environ['MASTER_PORT'] = '29500'
-
-        set_cuda_device_id(world_rank)
-
-        dist.init_process_group(backend='nccl', world_size=world_size, rank=world_rank)
-        save_function(world_rank, world_size, device)
-    return setup
-
+from onnxruntime.training import amp, optim, orttrainer
+from _test_helpers import distributed_setup, _load_pytorch_transformer_model, train, save, chunkify
 
 def single_node_full_precision(device = 'cuda', checkpoint_dir = 'checkpoint_dir/single_node/full_precision/'):
     learning_rate = 0.1
@@ -248,16 +207,16 @@ def distributed_zero_mixed_precision(world_rank, world_size, device, checkpoint_
     # save current model parameters as a checkpoint
     save(trainer, checkpoint_dir, 'state_dict_'+str(world_rank))
 
-if __name__ == '__main__':
-    function_map = {
-        'single_node_full_precision': single_node_full_precision,
-        'single_node_mixed_precision': single_node_mixed_precision,
-        'data_parallelism_full_precision': data_parallelism_full_precision,
-        'data_parallelism_mixed_precision': data_parallelism_mixed_precision,
-        'distributed_zero_full_precision': distributed_zero_full_precision,
-        'distributed_zero_mixed_precision': distributed_zero_mixed_precision
-    }
-    parser = argparse.ArgumentParser(description='Save states of trainers')
-    parser.add_argument('scenario', choices=function_map.keys(), help='training scenario to save states')
-    args = parser.parse_args()
-    function_map[args.scenario]()
+function_map = {
+    'single_node_full_precision': single_node_full_precision,
+    'single_node_mixed_precision': single_node_mixed_precision,
+    'data_parallelism_full_precision': data_parallelism_full_precision,
+    'data_parallelism_mixed_precision': data_parallelism_mixed_precision,
+    'distributed_zero_full_precision': distributed_zero_full_precision,
+    'distributed_zero_mixed_precision': distributed_zero_mixed_precision
+}
+parser = argparse.ArgumentParser(description='Save states of trainers')
+parser.add_argument('--scenario', choices=function_map.keys(), help='training scenario to save states', required=True)
+parser.add_argument('--checkpoint_dir', help='path to the directory where checkpoints can be saved', required=True)
+args = parser.parse_args()
+function_map[args.scenario](checkpoint_dir = args.checkpoint_dir)
